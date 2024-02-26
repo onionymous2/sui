@@ -12,6 +12,7 @@ use parking_lot::RwLock;
 use tokio::sync::{broadcast, watch};
 use tracing::warn;
 
+use crate::stake_aggregator::{QuorumThreshold, StakeAggregator};
 use crate::{
     block::{
         timestamp_utc_ms, Block, BlockAPI, BlockRef, BlockTimestampMs, BlockV1, Round, SignedBlock,
@@ -39,17 +40,18 @@ pub(crate) struct Core {
     context: Arc<Context>,
     /// The threshold clock that is used to keep track of the current round
     threshold_clock: ThresholdClock,
-    /// The last produced block
-    last_proposed_block: VerifiedBlock,
     /// The consumer to use in order to pull transactions to be included for the next proposals
     transaction_consumer: TransactionConsumer,
-    /// The pending ancestors to be included in proposals organised by round.
-    pending_ancestors: BTreeMap<Round, Vec<VerifiedBlock>>,
     /// The block manager which is responsible for keeping track of the DAG dependencies when processing new blocks
     /// and accept them or suspend if we are missing their causal history
     block_manager: BlockManager,
     /// Used to make commit decisions for leader blocks in the dag.
     committer: UniversalCommitter,
+    /// The last produced block
+    last_proposed_block: VerifiedBlock,
+    /// The blocks of the last included ancestors per authority. This map is basically used as a
+    /// watermark in order to include in the next block proposal only ancestors of higher rounds.
+    last_included_ancestors: BTreeMap<AuthorityIndex, BlockRef>,
     /// The last decided leader returned from the universal committer. Important to note
     /// that this does not signify that the leader has been persisted yet as it still has
     /// to go through CommitObserver and persist the commit in store. On recovery/restart
@@ -62,6 +64,8 @@ pub(crate) struct Core {
     signals: CoreSignals,
     /// The keypair to be used for block signing
     block_signer: ProtocolKeyPair,
+    /// The DagState is the gateway to interact with storage and buffered block data.
+    dag_state: Arc<RwLock<DagState>>,
     /// The node's storage
     store: Arc<dyn Store>,
 }
@@ -78,7 +82,7 @@ impl Core {
         dag_state: Arc<RwLock<DagState>>,
         store: Arc<dyn Store>,
     ) -> Self {
-        let (my_genesis_block, all_genesis_blocks) = Block::genesis(context.clone());
+        let (my_genesis_block, _) = Block::genesis(context.clone());
         let last_decided_leader = dag_state.read().last_commit_leader();
 
         let committer = UniversalCommitterBuilder::new(context.clone(), dag_state.clone())
@@ -91,44 +95,52 @@ impl Core {
             threshold_clock: ThresholdClock::new(0, context),
             last_proposed_block: my_genesis_block,
             transaction_consumer,
-            pending_ancestors: BTreeMap::new(),
+            last_included_ancestors: BTreeMap::new(),
             block_manager,
             committer,
             last_decided_leader,
             commit_observer,
             signals,
             block_signer,
+            dag_state,
             store,
         }
-        .recover(all_genesis_blocks)
+        .recover()
     }
 
-    fn recover(mut self, genesis_blocks: Vec<VerifiedBlock>) -> Self {
-        // We always need the genesis blocks as a starter point since we might not have advanced yet at all.
-        let mut all_blocks = genesis_blocks;
-
-        // Now fetch the proposed blocks per authority for their last two rounds.
-        let context = self.context.clone();
-        for (index, _authority) in context.committee.authorities() {
-            let blocks = self
-                .store
-                .scan_last_blocks_by_author(index, 2)
-                .expect("Storage error while recovering Core");
-            all_blocks.extend(blocks);
-        }
+    fn recover(mut self) -> Self {
+        // Fetch the proposed blocks per authority for their last two rounds.
+        let all_blocks = self
+            .context
+            .committee
+            .authorities()
+            .flat_map(|(index, _authority)| {
+                self.store
+                    .scan_last_blocks_by_author(index, 2, None)
+                    .expect("Storage error while recovering Core")
+            })
+            .collect::<Vec<_>>();
 
         // Recover the last proposed block
         self.last_proposed_block = all_blocks
             .iter()
-            .filter(|block| block.author() == context.own_index)
+            .filter(|block| block.author() == self.context.own_index)
             .max_by_key(|block| block.round())
             .cloned()
             .expect("At least one block - even genesis - should be present");
 
-        // Accept all blocks but make sure that only the last quorum round blocks and onwards are kept.
+
+        // Recover the last included round based on the last proposed block. This is not super accurate
+        // but good enough in order to make progress.
+        for ancestor in self.last_proposed_block.ancestors() {
+            self.last_included_ancestors
+                .insert(ancestor.author, *ancestor);
+        }
+
+        // Accept all blocks. That will ensure the threshold clock is pushed to the highest possible
+        // value and allow to propose for the correct round.
         // TODO: run commit and propose logic, or just use add_blocks() instead of add_accepted_blocks().
-        self.add_accepted_blocks(all_blocks, Some(0))
-            .expect("Error while recovering Core");
+        self.add_accepted_blocks(all_blocks).expect("Error while recovering Core");
         self
     }
 
@@ -143,7 +155,8 @@ impl Core {
         // Try to accept them via the block manager
         let (accepted_blocks, missing_blocks) = self.block_manager.try_accept_blocks(blocks)?;
 
-        self.add_accepted_blocks(accepted_blocks, None)?;
+        // Now process them, basically move the threshold clock and add them to pending list
+        self.add_accepted_blocks(accepted_blocks)?;
 
         // TODO: Add optimization for added blocks that do not achieve quorum for a round.
         self.try_commit()?;
@@ -157,15 +170,8 @@ impl Core {
     }
 
     /// Adds/processed all the newly `accepted_blocks`. We basically try to move the threshold clock and add them to the
-    /// pending ancestors list. The `pending_ancestors_retain_rounds` if defined then the method will retain on the pending ancestors
-    /// only the `pending_ancestors_retain_rounds` from the last formed quorum round. For example if set to zero (0), then
-    /// we'll strictly keep in the pending ancestors list the blocks of round >= last_quorum_round. If not defined, so None
-    /// is provided, then all the pending ancestors will be kep until the next block proposal.
-    fn add_accepted_blocks(
-        &mut self,
-        accepted_blocks: Vec<VerifiedBlock>,
-        pending_ancestors_retain_rounds: Option<u32>,
-    ) -> ConsensusResult<()> {
+    /// pending ancestors list.
+    fn add_accepted_blocks(&mut self, accepted_blocks: Vec<VerifiedBlock>) -> ConsensusResult<()> {
         // Advance the threshold clock. If advanced to a new round then send a signal that a new quorum has been received.
         if let Some(new_round) = self
             .threshold_clock
@@ -181,25 +187,6 @@ impl Core {
             .node_metrics
             .threshold_clock_round
             .set(self.threshold_clock.get_round() as i64);
-
-        for accepted_block in accepted_blocks {
-            self.pending_ancestors
-                .entry(accepted_block.round())
-                .or_default()
-                .push(accepted_block);
-        }
-
-        // TODO: we might need to consider the following:
-        // 1. Add some sort of protection from bulk catch ups - or intentional validator attack - that is flooding us with
-        // many blocks, so we don't spam the pending_ancestors list and OOM
-        // 2. Probably it doesn't make much sense to keep blocks around from too many rounds ago to reference as the data
-        // might not be relevant any more.
-        if let Some(retain_ancestor_rounds_from_quorum) = pending_ancestors_retain_rounds {
-            let last_quorum = self.threshold_clock.get_round().saturating_sub(1);
-            self.pending_ancestors.retain(|round, _| {
-                *round >= last_quorum.saturating_sub(retain_ancestor_rounds_from_quorum)
-            });
-        }
 
         Ok(())
     }
@@ -233,7 +220,7 @@ impl Core {
 
         // create a new block either because we want to "forcefully" propose a block due to a leader timeout,
         // or because we are actually ready to produce the block (leader exists)
-        if ignore_leaders_check || self.last_quorum_leaders_exist() {
+        if ignore_leaders_check || self.last_quorum_leaders_exist()? {
             // TODO: produce the block for the clock_round. As the threshold clock can advance many rounds at once (ex
             // because we synchronized a bulk of blocks) we can decide here whether we want to produce blocks per round
             // or just the latest one. From earlier experiments I saw only benefit on proposing for the penultimate round
@@ -242,7 +229,7 @@ impl Core {
 
             // 1. Consume the ancestors to be included in proposal
             let now = timestamp_utc_ms();
-            let ancestors = self.ancestors_to_propose(clock_round, now);
+            let ancestors = self.ancestors_to_propose(clock_round, now)?;
 
             // 2. Consume the next transactions to be included.
             let transactions = self.transaction_consumer.next();
@@ -267,12 +254,6 @@ impl Core {
 
             //4. Add to the threshold clock
             self.threshold_clock.add_block(verified_block.reference());
-
-            // Add to the pending ancestors
-            self.pending_ancestors
-                .entry(verified_block.round())
-                .or_default()
-                .push(verified_block.clone());
 
             let (accepted_blocks, missing) = self
                 .block_manager
@@ -317,19 +298,46 @@ impl Core {
         self.block_manager.missing_blocks()
     }
 
-    /// Retrieves the next ancestors to propose to form a block at `clock_round` round. Also the `block_timestamp` is provided
+    /// Retrieves the next ancestors to propose to form a block at `clock_round` round. Also, the `block_timestamp` is provided
     /// to sanity check that everything that goes into the proposal is ensured to have a timestamp < block_timestamp
     fn ancestors_to_propose(
         &mut self,
         clock_round: Round,
         block_timestamp: BlockTimestampMs,
-    ) -> Vec<BlockRef> {
-        // Now take all the ancestors up to the clock_round (excluded) and then remove them from the map.
+    ) -> ConsensusResult<Vec<BlockRef>> {
+        // Now take the ancestors before the clock_round (excluded) for each authority.
         let ancestors = self
-            .pending_ancestors
-            .range(0..clock_round)
-            .flat_map(|(_, blocks)| blocks)
+            .dag_state
+            .read()
+            .get_last_block_per_authority(clock_round - 1)?;
+
+        // Propose only ancestors of higher rounds than what has already been proposed
+        let ancestors = ancestors
+            .into_iter()
+            .flat_map(|block| {
+                if let Some(last_block_ref) = self.last_included_ancestors.get(&block.author()) {
+                    return (last_block_ref.round < block.round()).then_some(block);
+                }
+                Some(block)
+            })
             .collect::<Vec<_>>();
+
+        // Update the last included ancestor block refs
+        for ancestor in &ancestors {
+            self.last_included_ancestors
+                .insert(ancestor.author(), ancestor.reference());
+        }
+
+        // TODO: this is for temporary sanity check - we might want to remove later on
+        let mut quorum = StakeAggregator::<QuorumThreshold>::new();
+        for ancestor in ancestors
+            .iter()
+            .filter(|block| block.round() == clock_round - 1)
+        {
+            quorum.add(ancestor.author(), &self.context.committee);
+        }
+
+        assert!(quorum.reached_threshold(&self.context.committee), "Fatal error, quorum not reached for parent round when proposing for round {}. Possible mismatch between DagState and Core.", clock_round);
 
         // Ensure that timestamps are correct
         ancestors.iter().for_each(|block|{
@@ -347,17 +355,13 @@ impl Core {
         // Keep block refs to propose in a map, so even if somehow a byzantine node managed to provide blocks that don't
         // form a valid chain we can still pick one block per author.
         let mut to_propose = BTreeMap::new();
-        for block in ancestors.into_iter() {
+        for block in &ancestors {
             if !all_ancestors_parents.contains(&block.reference()) {
                 to_propose.insert(block.author(), block.reference());
             }
         }
 
         assert!(!to_propose.is_empty());
-
-        // Now clean up the pending ancestors
-        self.pending_ancestors
-            .retain(|round, _blocks| *round >= clock_round);
 
         // always include our last proposed block in front of the vector and make sure that we do not
         // double insert.
@@ -368,34 +372,35 @@ impl Core {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Checks whether all the leaders of the previous quorum exist.
     /// TODO: we can leverage some additional signal here in order to more cleverly manipulate later the leader timeout
     /// Ex if we already have one leader - the first in order - we might don't want to wait as much.
-    fn last_quorum_leaders_exist(&self) -> bool {
-        // TODO: check that we are ready to produce a new block. This will mainly check that the leaders of the previous
-        // quorum exist.
+    fn last_quorum_leaders_exist(&self) -> ConsensusResult<bool> {
         let quorum_round = self.threshold_clock.get_round().saturating_sub(1);
 
-        let leaders = self.leaders(quorum_round);
-        if let Some(ancestors) = self.pending_ancestors.get(&quorum_round) {
+        let dag_state = self.dag_state.read();
+        for leader in self.leaders(quorum_round) {
             // Search for all the leaders. If at least one is not found, then return false.
             // A linear search should be fine here as the set of elements is not expected to be small enough and more sophisticated
             // data structures might not give us much here.
-            return leaders.iter().all(|leader| {
-                ancestors
-                    .iter()
-                    .any(|entry| entry.reference().author == *leader)
-            });
+            if dag_state.contains_block_at_slot(leader)? {
+                return Ok(true);
+            }
         }
-        false
+
+        Ok(false)
     }
 
     /// Returns the leaders of the provided round.
-    fn leaders(&self, round: Round) -> Vec<AuthorityIndex> {
-        self.committer.get_leaders(round)
+    fn leaders(&self, round: Round) -> Vec<Slot> {
+        self.committer
+            .get_leaders(round)
+            .into_iter()
+            .map(|authority_index| Slot::new(round, authority_index))
+            .collect()
     }
 
     fn last_proposed_round(&self) -> Round {

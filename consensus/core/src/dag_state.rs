@@ -257,6 +257,48 @@ impl DagState {
         Ok(blocks)
     }
 
+    /// Returns the last block proposed per authority with round <= `before_round`. The method will look
+    /// into cache first, otherwise will fall back in store. The method guarantees to return a result for
+    /// each authority, even if that's genesis block.
+    pub(crate) fn get_last_block_per_authority(
+        &self,
+        before_round: Round,
+    ) -> ConsensusResult<Vec<VerifiedBlock>> {
+        let mut blocks = vec![None; self.context.committee.size()];
+
+        for (block_ref, block) in self.recent_blocks.range((
+            Included(BlockRef::new(0, AuthorityIndex::ZERO, BlockDigest::MIN)),
+            Excluded(BlockRef::new(
+                before_round + 1,
+                AuthorityIndex::ZERO,
+                BlockDigest::MIN,
+            )),
+        )) {
+            blocks[block_ref.author] = Some(block.clone());
+        }
+
+        // Now find out all the authority positions that are None. For those look into store
+        // If still nothing is found then return genesis. We are deliberately not filtering
+        for (authority_index, _) in self.context.committee.authorities() {
+            if blocks[authority_index].is_some() {
+                continue;
+            }
+            let result =
+                self.store
+                    .scan_last_blocks_by_author(authority_index, 1, Some(before_round))?;
+            if result.is_empty() {
+                let (_, genesis_block) = self
+                    .genesis
+                    .iter()
+                    .find(|(block_ref, _)| block_ref.author == authority_index)
+                    .expect("Genesis should be found for authority {authority_index}");
+                blocks[authority_index] = Some(genesis_block.clone());
+            }
+        }
+
+        Ok(blocks.into_iter().flatten().collect())
+    }
+
     pub(crate) fn contains_block(&self, block_ref: &BlockRef) -> ConsensusResult<bool> {
         let blocks = self.contains_blocks(vec![*block_ref])?;
         Ok(blocks.first().cloned().expect("Result should be present"))
@@ -293,6 +335,19 @@ impl DagState {
         }
 
         Ok(blocks)
+    }
+
+    pub(crate) fn contains_block_at_slot(&self, slot: Slot) -> ConsensusResult<bool> {
+        let mut result = self.cached_refs[slot.authority].range((
+            Included(BlockRef::new(slot.round, slot.authority, BlockDigest::MIN)),
+            Included(BlockRef::new(slot.round, slot.authority, BlockDigest::MAX)),
+        ));
+
+        // If no block found for that slot in cache we need to look up in store
+        if result.next().is_none() {
+            return self.store.contains_block_at_slot(slot);
+        }
+        Ok(true)
     }
 
     pub(crate) fn highest_accepted_round(&self) -> Round {
