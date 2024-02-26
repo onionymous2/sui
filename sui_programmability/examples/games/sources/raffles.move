@@ -31,6 +31,7 @@ module games::raffle_with_tickets {
     const EGameMismatch: u64 = 3;
     const ENotWinner: u64 = 4;
     const ENoParticipants: u64 = 4;
+    const EMaxParticipantsReached: u64 = 5;
 
     /// Game represents a set of parameters of a single game.
     struct Game has key {
@@ -192,7 +193,6 @@ module games::small_raffle {
             balance::destroy_zero(balance);
         };
 
-        // TODO: will this work with 10K objects?
         let i = 1;
         while (i <= participants) {
             table::remove(&mut participants_table, i);
@@ -208,6 +208,8 @@ module games::small_raffle {
         assert!(coin::value(&coin) == game.cost_in_sui, EInvalidAmount);
 
         game.participants = game.participants + 1;
+        assert!(game.participants < 500, EMaxParticipantsReached);
+
         coin::put(&mut game.balance, coin);
         table::add(&mut game.participants_table, game.participants, sender(ctx));
     }

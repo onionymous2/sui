@@ -270,7 +270,7 @@ module sui::random {
         (u128_in_range(g, (min as u128), (max as u128), 9) as u8)
     }
 
-    /// Shuffle a vector using the random generator.
+    /// Shuffle a vector using the random generator (Fisher-Yates/Knuth shuffle).
     public fun shuffle<T>(g: &mut RandomGenerator, v: &mut vector<T>) {
         let n = (vector::length(v) as u32);
         if (n == 0) {
