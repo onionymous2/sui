@@ -129,7 +129,6 @@ impl Core {
             .cloned()
             .expect("At least one block - even genesis - should be present");
 
-
         // Recover the last included round based on the last proposed block. This is not super accurate
         // but good enough in order to make progress.
         for ancestor in self.last_proposed_block.ancestors() {
@@ -140,7 +139,8 @@ impl Core {
         // Accept all blocks. That will ensure the threshold clock is pushed to the highest possible
         // value and allow to propose for the correct round.
         // TODO: run commit and propose logic, or just use add_blocks() instead of add_accepted_blocks().
-        self.add_accepted_blocks(all_blocks).expect("Error while recovering Core");
+        self.add_accepted_blocks(all_blocks)
+            .expect("Error while recovering Core");
         self
     }
 

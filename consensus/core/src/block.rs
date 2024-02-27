@@ -500,6 +500,15 @@ impl VerifiedBlock {
     }
 }
 
+impl From<&VerifiedBlock> for Slot {
+    fn from(value: &VerifiedBlock) -> Self {
+        Self {
+            round: value.round(),
+            authority: value.author(),
+        }
+    }
+}
+
 /// Allow quick access on the underlying Block without having to always refer to the inner block ref.
 impl Deref for VerifiedBlock {
     type Target = Block;

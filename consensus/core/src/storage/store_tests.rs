@@ -6,6 +6,7 @@ use rstest::rstest;
 use tempfile::TempDir;
 
 use super::{mem_store::MemStore, rocksdb_store::RocksDBStore, Store};
+use crate::block::Slot;
 use crate::{
     block::{BlockDigest, BlockRef, TestBlock, VerifiedBlock},
     commit::Commit,
@@ -98,6 +99,20 @@ async fn read_and_contain_blocks(
         assert!(contain_blocks[0]);
         assert!(!contain_blocks[1]);
         assert!(contain_blocks[2]);
+    }
+
+    {
+        for block in &written_blocks {
+            let found = store
+                .contains_block_at_slot(block.into())
+                .expect("Read blocks should not fail");
+            assert!(found);
+        }
+
+        let found = store
+            .contains_block_at_slot(Slot::new(10, AuthorityIndex::new_for_test(0)))
+            .expect("Read blocks should not fail");
+        assert!(!found);
     }
 }
 

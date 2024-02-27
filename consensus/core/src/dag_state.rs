@@ -259,22 +259,33 @@ impl DagState {
 
     /// Returns the last block proposed per authority with round <= `before_round`. The method will look
     /// into cache first, otherwise will fall back in store. The method guarantees to return a result for
-    /// each authority, even if that's genesis block.
+    /// each authority, even if that's genesis block. In case of equivocation for an authority's last slot
+    /// only one block will be returned (the last in order).
     pub(crate) fn get_last_block_per_authority(
         &self,
         before_round: Round,
     ) -> ConsensusResult<Vec<VerifiedBlock>> {
         let mut blocks = vec![None; self.context.committee.size()];
 
-        for (block_ref, block) in self.recent_blocks.range((
-            Included(BlockRef::new(0, AuthorityIndex::ZERO, BlockDigest::MIN)),
-            Excluded(BlockRef::new(
-                before_round + 1,
-                AuthorityIndex::ZERO,
-                BlockDigest::MIN,
-            )),
-        )) {
-            blocks[block_ref.author] = Some(block.clone());
+        for (authority_index, block_refs) in self.cached_refs.iter().enumerate() {
+            if let Some(block_ref) = block_refs
+                .range((
+                    Included(BlockRef::new(0, AuthorityIndex::ZERO, BlockDigest::MIN)),
+                    Excluded(BlockRef::new(
+                        before_round + 1,
+                        AuthorityIndex::ZERO,
+                        BlockDigest::MIN,
+                    )),
+                ))
+                .next_back()
+            {
+                let block = self
+                    .recent_blocks
+                    .get(block_ref)
+                    .expect("Block should exist in recent blocks");
+
+                blocks[block_ref.author] = Some(block.clone());
+            }
         }
 
         // Now find out all the authority positions that are None. For those look into store
@@ -293,6 +304,9 @@ impl DagState {
                     .find(|(block_ref, _)| block_ref.author == authority_index)
                     .expect("Genesis should be found for authority {authority_index}");
                 blocks[authority_index] = Some(genesis_block.clone());
+            } else {
+                // in case of equivocation we'll just get whatever is the last one
+                blocks[authority_index] = result.last().cloned();
             }
         }
 
@@ -338,16 +352,26 @@ impl DagState {
     }
 
     pub(crate) fn contains_block_at_slot(&self, slot: Slot) -> ConsensusResult<bool> {
-        let mut result = self.cached_refs[slot.authority].range((
-            Included(BlockRef::new(slot.round, slot.authority, BlockDigest::MIN)),
-            Included(BlockRef::new(slot.round, slot.authority, BlockDigest::MAX)),
-        ));
-
-        // If no block found for that slot in cache we need to look up in store
-        if result.next().is_none() {
-            return self.store.contains_block_at_slot(slot);
+        // Always return true for genesis slots.
+        if slot.round == 0 {
+            return Ok(true);
         }
-        Ok(true)
+
+        // If the slot we are looking for is within the cached rounds set, then it's enough to only
+        // look in cached_refs and not in store. Otherwise we'll need to go to store
+        if let Some(lowest_round_ref) = self.cached_refs[slot.authority].first() {
+            if slot.round >= lowest_round_ref.round {
+                let mut result = self.cached_refs[slot.authority].range((
+                    Included(BlockRef::new(slot.round, slot.authority, BlockDigest::MIN)),
+                    Included(BlockRef::new(slot.round, slot.authority, BlockDigest::MAX)),
+                ));
+                return Ok(result.next().is_some());
+            }
+        }
+
+        // If the slot we are looking for can not be covered from the in-memory data then we check
+        // in store directly.
+        self.store.contains_block_at_slot(slot)
     }
 
     pub(crate) fn highest_accepted_round(&self) -> Round {
@@ -411,6 +435,23 @@ impl DagState {
         match &self.last_commit {
             Some(commit) => commit.leader.round,
             None => 0,
+        }
+    }
+
+    /// Should be used only for testing. Retains only the cache elements that are `< round` and flushes
+    /// the rest in store.
+    #[cfg(test)]
+    fn flush_cache_for_testing(&mut self, round: Round) {
+        for mut block_refs in &mut self.cached_refs {
+            block_refs.retain(|block_ref| block_ref.round >= round);
+        }
+        while let Some((block_ref, block)) = self.recent_blocks.first_key_value() {
+            if block_ref.round < round {
+                self.store.write(vec![block.clone()], vec![]).unwrap();
+                self.recent_blocks.pop_first();
+            } else {
+                break;
+            }
         }
     }
 }
@@ -728,16 +769,31 @@ mod test {
         let mut expected = vec![true; (num_rounds * num_authorities) as usize];
         assert_eq!(result, expected);
 
+        // Attempt to check the same for via the contains slot method
+        for block_ref in block_refs.clone() {
+            let slot = block_ref.into();
+            let found = dag_state.contains_block_at_slot(slot).unwrap();
+            assert!(found, "A block should be found at slot {}", slot);
+        }
+
         // Now try to ask also for one block ref that is neither in cache nor in store
         block_refs.insert(
             3,
             BlockRef::new(11, AuthorityIndex::new_for_test(3), BlockDigest::default()),
         );
-        let result = dag_state.contains_blocks(block_refs).unwrap();
+        let result = dag_state.contains_blocks(block_refs.clone()).unwrap();
 
         // Then all should be found apart from the last one
         expected.insert(3, false);
-        assert_eq!(result, expected);
+        assert_eq!(result, expected.clone());
+
+        // Attempt to check the same for via the contains slot method
+        for block_ref in block_refs.clone() {
+            let slot = block_ref.into();
+            let found = dag_state.contains_block_at_slot(slot).unwrap();
+
+            assert_eq!(expected.remove(0), found);
+        }
     }
 
     #[test]
@@ -794,5 +850,51 @@ mod test {
         // Then all should be found apart from the last one
         expected.insert(3, None);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_get_last_block_per_authority() {
+        // GIVEN
+        let (context, _) = Context::new_for_test(4);
+        let context = Arc::new(context);
+        let store = Arc::new(MemStore::new());
+        let mut dag_state = DagState::new(context.clone(), store.clone());
+
+        // Create no blocks for authority 0
+        // Create one block (round 1) for authority 1
+        // Create two blocks (rounds 1,2) for authority 2
+        // Create three blocks (rounds 1,2,3) for authority 3
+        for author in 1..=3 {
+            for round in 1..=author {
+                let block = VerifiedBlock::new_for_test(TestBlock::new(round, author).build());
+                dag_state.accept_block(block.clone());
+            }
+        }
+
+        // WHEN search for the latest blocks
+        let before_round = 2;
+        let last_blocks = dag_state
+            .get_last_block_per_authority(before_round)
+            .unwrap();
+
+        // THEN
+        assert_eq!(last_blocks[0].round(), 0);
+        assert_eq!(last_blocks[1].round(), 1);
+        assert_eq!(last_blocks[2].round(), 2);
+        assert_eq!(last_blocks[3].round(), 2);
+
+        // WHEN (clean up state)
+        dag_state.flush_cache_for_testing(3);
+
+        // AND
+        let last_blocks = dag_state
+            .get_last_block_per_authority(before_round)
+            .unwrap();
+
+        // THEN blocks should be fetched now from store
+        assert_eq!(last_blocks[0].round(), 0);
+        assert_eq!(last_blocks[1].round(), 1);
+        assert_eq!(last_blocks[2].round(), 2);
+        assert_eq!(last_blocks[3].round(), 2);
     }
 }
