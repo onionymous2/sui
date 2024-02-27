@@ -261,10 +261,7 @@ impl DagState {
     /// into cache first, otherwise will fall back in store. The method guarantees to return a result for
     /// each authority, even if that's genesis block. In case of equivocation for an authority's last slot
     /// only one block will be returned (the last in order).
-    pub(crate) fn get_last_block_per_authority(
-        &self,
-        before_round: Round,
-    ) -> ConsensusResult<Vec<VerifiedBlock>> {
+    pub(crate) fn get_last_block_per_authority(&self, before_round: Round) -> Vec<VerifiedBlock> {
         let mut blocks = vec![None; self.context.committee.size()];
 
         for (authority_index, block_refs) in self.cached_refs.iter().enumerate() {
@@ -294,9 +291,10 @@ impl DagState {
             if blocks[authority_index].is_some() {
                 continue;
             }
-            let result =
-                self.store
-                    .scan_last_blocks_by_author(authority_index, 1, Some(before_round))?;
+            let result = self
+                .store
+                .scan_last_blocks_by_author(authority_index, 1, Some(before_round))
+                .unwrap_or_else(|e| panic!("Failed to read from storage: {:?}", e));
             if result.is_empty() {
                 let (_, genesis_block) = self
                     .genesis
@@ -310,7 +308,7 @@ impl DagState {
             }
         }
 
-        Ok(blocks.into_iter().flatten().collect())
+        blocks.into_iter().flatten().collect()
     }
 
     pub(crate) fn contains_block(&self, block_ref: &BlockRef) -> ConsensusResult<bool> {
@@ -351,10 +349,10 @@ impl DagState {
         Ok(blocks)
     }
 
-    pub(crate) fn contains_block_at_slot(&self, slot: Slot) -> ConsensusResult<bool> {
+    pub(crate) fn contains_block_at_slot(&self, slot: Slot) -> bool {
         // Always return true for genesis slots.
         if slot.round == 0 {
-            return Ok(true);
+            return true;
         }
 
         // If the slot we are looking for is within the cached rounds set, then it's enough to only
@@ -365,13 +363,15 @@ impl DagState {
                     Included(BlockRef::new(slot.round, slot.authority, BlockDigest::MIN)),
                     Included(BlockRef::new(slot.round, slot.authority, BlockDigest::MAX)),
                 ));
-                return Ok(result.next().is_some());
+                return result.next().is_some();
             }
         }
 
         // If the slot we are looking for can not be covered from the in-memory data then we check
         // in store directly.
-        self.store.contains_block_at_slot(slot)
+        self.store
+            .contains_block_at_slot(slot)
+            .unwrap_or_else(|e| panic!("Failed to read from storage: {:?}", e))
     }
 
     pub(crate) fn highest_accepted_round(&self) -> Round {
@@ -772,7 +772,7 @@ mod test {
         // Attempt to check the same for via the contains slot method
         for block_ref in block_refs.clone() {
             let slot = block_ref.into();
-            let found = dag_state.contains_block_at_slot(slot).unwrap();
+            let found = dag_state.contains_block_at_slot(slot);
             assert!(found, "A block should be found at slot {}", slot);
         }
 
@@ -790,7 +790,7 @@ mod test {
         // Attempt to check the same for via the contains slot method
         for block_ref in block_refs.clone() {
             let slot = block_ref.into();
-            let found = dag_state.contains_block_at_slot(slot).unwrap();
+            let found = dag_state.contains_block_at_slot(slot);
 
             assert_eq!(expected.remove(0), found);
         }
@@ -873,9 +873,7 @@ mod test {
 
         // WHEN search for the latest blocks
         let before_round = 2;
-        let last_blocks = dag_state
-            .get_last_block_per_authority(before_round)
-            .unwrap();
+        let last_blocks = dag_state.get_last_block_per_authority(before_round);
 
         // THEN
         assert_eq!(last_blocks[0].round(), 0);
@@ -887,9 +885,7 @@ mod test {
         dag_state.flush_cache_for_testing(3);
 
         // AND
-        let last_blocks = dag_state
-            .get_last_block_per_authority(before_round)
-            .unwrap();
+        let last_blocks = dag_state.get_last_block_per_authority(before_round);
 
         // THEN blocks should be fetched now from store
         assert_eq!(last_blocks[0].round(), 0);

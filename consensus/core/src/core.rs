@@ -220,7 +220,7 @@ impl Core {
 
         // create a new block either because we want to "forcefully" propose a block due to a leader timeout,
         // or because we are actually ready to produce the block (leader exists)
-        if ignore_leaders_check || self.last_quorum_leaders_exist()? {
+        if ignore_leaders_check || self.last_quorum_leaders_exist() {
             // TODO: produce the block for the clock_round. As the threshold clock can advance many rounds at once (ex
             // because we synchronized a bulk of blocks) we can decide here whether we want to produce blocks per round
             // or just the latest one. From earlier experiments I saw only benefit on proposing for the penultimate round
@@ -229,7 +229,7 @@ impl Core {
 
             // 1. Consume the ancestors to be included in proposal
             let now = timestamp_utc_ms();
-            let ancestors = self.ancestors_to_propose(clock_round, now)?;
+            let ancestors = self.ancestors_to_propose(clock_round, now);
 
             // 2. Consume the next transactions to be included.
             let transactions = self.transaction_consumer.next();
@@ -304,12 +304,12 @@ impl Core {
         &mut self,
         clock_round: Round,
         block_timestamp: BlockTimestampMs,
-    ) -> ConsensusResult<Vec<BlockRef>> {
+    ) -> Vec<BlockRef> {
         // Now take the ancestors before the clock_round (excluded) for each authority.
         let ancestors = self
             .dag_state
             .read()
-            .get_last_block_per_authority(clock_round - 1)?;
+            .get_last_block_per_authority(clock_round - 1);
 
         // Propose only ancestors of higher rounds than what has already been proposed
         let ancestors = ancestors
@@ -372,13 +372,13 @@ impl Core {
             }
         }
 
-        Ok(result)
+        result
     }
 
     /// Checks whether all the leaders of the previous quorum exist.
     /// TODO: we can leverage some additional signal here in order to more cleverly manipulate later the leader timeout
     /// Ex if we already have one leader - the first in order - we might don't want to wait as much.
-    fn last_quorum_leaders_exist(&self) -> ConsensusResult<bool> {
+    fn last_quorum_leaders_exist(&self) -> bool {
         let quorum_round = self.threshold_clock.get_round().saturating_sub(1);
 
         let dag_state = self.dag_state.read();
@@ -386,12 +386,12 @@ impl Core {
             // Search for all the leaders. If at least one is not found, then return false.
             // A linear search should be fine here as the set of elements is not expected to be small enough and more sophisticated
             // data structures might not give us much here.
-            if dag_state.contains_block_at_slot(leader)? {
-                return Ok(true);
+            if dag_state.contains_block_at_slot(leader) {
+                return true;
             }
         }
 
-        Ok(false)
+        false
     }
 
     /// Returns the leaders of the provided round.
