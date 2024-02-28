@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use consensus_config::{AuthorityIndex, ProtocolKeyPair};
+use consensus_config::ProtocolKeyPair;
 use mysten_metrics::monitored_scope;
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, watch};
@@ -48,9 +48,10 @@ pub(crate) struct Core {
     committer: UniversalCommitter,
     /// The last produced block
     last_proposed_block: VerifiedBlock,
-    /// The blocks of the last included ancestors per authority. This map is basically used as a
+    /// The blocks of the last included ancestors per authority. This vector is basically used as a
     /// watermark in order to include in the next block proposal only ancestors of higher rounds.
-    last_included_ancestors: BTreeMap<AuthorityIndex, BlockRef>,
+    /// By default, is initialised with `None` values.
+    last_included_ancestors: Vec<Option<BlockRef>>,
     /// The last decided leader returned from the universal committer. Important to note
     /// that this does not signify that the leader has been persisted yet as it still has
     /// to go through CommitObserver and persist the commit in store. On recovery/restart
@@ -78,7 +79,6 @@ impl Core {
         block_signer: ProtocolKeyPair,
         dag_state: Arc<RwLock<DagState>>,
     ) -> Self {
-        let (my_genesis_block, _) = Block::genesis(context.clone());
         let last_decided_leader = dag_state.read().last_commit_leader();
 
         let committer = UniversalCommitterBuilder::new(context.clone(), dag_state.clone())
@@ -86,12 +86,24 @@ impl Core {
             .with_pipeline(true)
             .build();
 
+        // Recover the last proposed block
+        let last_proposed_block = dag_state
+            .read()
+            .get_last_block_for_authority(context.own_index);
+
+        // Recover the last included round based on the last proposed block. This is not super accurate
+        // but good enough in order to make progress.
+        let mut last_included_ancestors = vec![None; context.committee.size()];
+        for ancestor in last_proposed_block.ancestors() {
+            last_included_ancestors[ancestor.author] = Some(*ancestor);
+        }
+
         Self {
             context: context.clone(),
-            threshold_clock: ThresholdClock::new(0, context),
-            last_proposed_block: my_genesis_block,
+            threshold_clock: ThresholdClock::new(0, context.clone()),
+            last_proposed_block,
             transaction_consumer,
-            last_included_ancestors: BTreeMap::new(),
+            last_included_ancestors,
             block_manager,
             committer,
             last_decided_leader,
@@ -104,24 +116,8 @@ impl Core {
     }
 
     fn recover(mut self) -> Self {
-        // Recover the last proposed block
-        let last_proposed_block = self
-            .dag_state
-            .read()
-            .get_last_block_for_authority(self.context.own_index);
-
-        // Recover the last included round based on the last proposed block. This is not super accurate
-        // but good enough in order to make progress.
-        let last_included_ancestors = last_proposed_block
-            .ancestors()
-            .iter()
-            .map(|ancestor| (ancestor.author, *ancestor))
-            .collect::<BTreeMap<_, _>>();
-
-        self.last_included_ancestors = last_included_ancestors;
-        self.last_proposed_block = last_proposed_block;
-
         // Recover the last available quorum to correctly advance the threshold clock.
+        // TODO: run commit and propose logic, or just use add_blocks() instead of add_accepted_blocks().
         let last_quorum = self.dag_state.read().last_quorum();
         self.add_accepted_blocks(last_quorum)
             .expect("Fatal error while recovering Core");
@@ -299,7 +295,7 @@ impl Core {
         let ancestors = ancestors
             .into_iter()
             .flat_map(|block| {
-                if let Some(last_block_ref) = self.last_included_ancestors.get(&block.author()) {
+                if let Some(last_block_ref) = self.last_included_ancestors[block.author()] {
                     return (last_block_ref.round < block.round()).then_some(block);
                 }
                 Some(block)
@@ -308,8 +304,7 @@ impl Core {
 
         // Update the last included ancestor block refs
         for ancestor in &ancestors {
-            self.last_included_ancestors
-                .insert(ancestor.author(), ancestor.reference());
+            self.last_included_ancestors[ancestor.author()] = Some(ancestor.reference());
         }
 
         // TODO: this is for temporary sanity check - we might want to remove later on
@@ -481,7 +476,7 @@ impl CoreSignalsReceivers {
 mod test {
     use std::{collections::BTreeSet, time::Duration};
 
-    use consensus_config::{local_committee_and_keys, Stake};
+    use consensus_config::{local_committee_and_keys, AuthorityIndex, Stake};
     use sui_protocol_config::ProtocolConfig;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
