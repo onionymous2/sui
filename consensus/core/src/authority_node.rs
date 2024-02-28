@@ -130,7 +130,7 @@ where
             commit_consumer.sender,
             commit_consumer.last_processed_index,
             dag_state.clone(),
-            store.clone(),
+            store,
         );
 
         let core = Core::new(
@@ -141,7 +141,6 @@ where
             core_signals,
             protocol_keypair,
             dag_state.clone(),
-            store,
         );
 
         let (core_dispatcher, core_thread_handle) =

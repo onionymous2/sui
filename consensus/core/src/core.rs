@@ -23,7 +23,6 @@ use crate::{
     context::Context,
     dag_state::DagState,
     error::ConsensusResult,
-    storage::Store,
     threshold_clock::ThresholdClock,
     transaction::TransactionConsumer,
     universal_committer::{
@@ -66,8 +65,6 @@ pub(crate) struct Core {
     block_signer: ProtocolKeyPair,
     /// The DagState is the gateway to interact with storage and buffered block data.
     dag_state: Arc<RwLock<DagState>>,
-    /// The node's storage
-    store: Arc<dyn Store>,
 }
 
 #[allow(dead_code)]
@@ -80,7 +77,6 @@ impl Core {
         signals: CoreSignals,
         block_signer: ProtocolKeyPair,
         dag_state: Arc<RwLock<DagState>>,
-        store: Arc<dyn Store>,
     ) -> Self {
         let (my_genesis_block, _) = Block::genesis(context.clone());
         let last_decided_leader = dag_state.read().last_commit_leader();
@@ -103,44 +99,32 @@ impl Core {
             signals,
             block_signer,
             dag_state,
-            store,
         }
         .recover()
     }
 
     fn recover(mut self) -> Self {
-        // Fetch the proposed blocks per authority for their last two rounds.
-        let all_blocks = self
-            .context
-            .committee
-            .authorities()
-            .flat_map(|(index, _authority)| {
-                self.store
-                    .scan_last_blocks_by_author(index, 2, None)
-                    .expect("Storage error while recovering Core")
-            })
-            .collect::<Vec<_>>();
-
         // Recover the last proposed block
-        self.last_proposed_block = all_blocks
-            .iter()
-            .filter(|block| block.author() == self.context.own_index)
-            .max_by_key(|block| block.round())
-            .cloned()
-            .expect("At least one block - even genesis - should be present");
+        let last_proposed_block = self
+            .dag_state
+            .read()
+            .get_last_block_for_authority(self.context.own_index);
 
         // Recover the last included round based on the last proposed block. This is not super accurate
         // but good enough in order to make progress.
-        for ancestor in self.last_proposed_block.ancestors() {
-            self.last_included_ancestors
-                .insert(ancestor.author, *ancestor);
-        }
+        let last_included_ancestors = last_proposed_block
+            .ancestors()
+            .iter()
+            .map(|ancestor| (ancestor.author, *ancestor))
+            .collect::<BTreeMap<_, _>>();
 
-        // Accept all blocks. That will ensure the threshold clock is pushed to the highest possible
-        // value and allow to propose for the correct round.
-        // TODO: run commit and propose logic, or just use add_blocks() instead of add_accepted_blocks().
-        self.add_accepted_blocks(all_blocks)
-            .expect("Error while recovering Core");
+        self.last_included_ancestors = last_included_ancestors;
+        self.last_proposed_block = last_proposed_block;
+
+        // Recover the last available quorum to correctly advance the threshold clock.
+        let last_quorum = self.dag_state.read().last_quorum();
+        self.add_accepted_blocks(last_quorum)
+            .expect("Fatal error while recovering Core");
         self
     }
 
@@ -309,7 +293,7 @@ impl Core {
         let ancestors = self
             .dag_state
             .read()
-            .get_last_block_per_authority(clock_round - 1);
+            .get_last_block_per_authority(Some(clock_round - 1));
 
         // Propose only ancestors of higher rounds than what has already been proposed
         let ancestors = ancestors
@@ -502,7 +486,10 @@ mod test {
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
     use super::*;
-    use crate::{block::TestBlock, storage::mem_store::MemStore, transaction::TransactionClient};
+    use crate::{
+        block::TestBlock, storage::mem_store::MemStore, storage::Store,
+        transaction::TransactionClient,
+    };
 
     /// Recover Core and continue proposing from the last round which forms a quorum.
     #[tokio::test]
@@ -562,7 +549,6 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
-            store.clone(),
         );
 
         // New round should be 5
@@ -666,7 +652,6 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
-            store.clone(),
         );
 
         // New round should be 4
@@ -742,7 +727,6 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
-            store.clone(),
         );
 
         // Send some transactions
@@ -836,7 +820,6 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
-            store.clone(),
         );
 
         let mut expected_ancestors = BTreeSet::new();
@@ -889,7 +872,7 @@ mod test {
         for round in 1..=3 {
             let mut this_round_blocks = Vec::new();
 
-            for (core, _signal_receivers, _) in &mut cores {
+            for (core, _signal_receivers, _, _) in &mut cores {
                 core.add_blocks(last_round_blocks.clone()).unwrap();
 
                 assert_eq!(core.last_proposed_round(), round);
@@ -902,26 +885,25 @@ mod test {
 
         // Try to create the blocks for round 4 by calling the try_new_block method. No block should be created as the
         // leader - authority 3 - hasn't proposed any block.
-        for (core, _, _) in &mut cores {
+        for (core, _, _, _) in &mut cores {
             core.add_blocks(last_round_blocks.clone()).unwrap();
             assert!(core.try_new_block(false).unwrap().is_none());
         }
 
         // Now try to create the blocks for round 4 via the leader timeout method which should ignore any leader checks
-        for (core, _, _) in &mut cores {
+        for (core, _, _, store) in &mut cores {
             assert!(core.force_new_block(4).unwrap().is_some());
             assert_eq!(core.last_proposed_round(), 4);
 
             // Check commits have been persisted to store
-            let last_commit = core
-                .store
+            let last_commit = store
                 .read_last_commit()
                 .unwrap()
                 .expect("last commit should be set");
             // There are 1 leader rounds with rounds completed up to and including
             // round 4
             assert_eq!(last_commit.index, 1);
-            let all_stored_commits = core.store.scan_commits(0).unwrap();
+            let all_stored_commits = store.scan_commits(0).unwrap();
             assert_eq!(all_stored_commits.len(), 1);
         }
     }
@@ -937,7 +919,7 @@ mod test {
         for round in 1..=10 {
             let mut this_round_blocks = Vec::new();
 
-            for (core, signal_receivers, _) in &mut cores {
+            for (core, signal_receivers, _, _) in &mut cores {
                 // add the blocks from last round
                 // this will trigger a block creation for the round and a signal should be emitted
                 core.add_blocks(last_round_blocks.clone()).unwrap();
@@ -983,10 +965,9 @@ mod test {
             last_round_blocks = this_round_blocks;
         }
 
-        for (core, _, _) in cores {
+        for (_, _, _, store) in cores {
             // Check commits have been persisted to store
-            let last_commit = core
-                .store
+            let last_commit = store
                 .read_last_commit()
                 .unwrap()
                 .expect("last commit should be set");
@@ -994,7 +975,7 @@ mod test {
             // round 9. Round 10 blocks will only include their own blocks, so the
             // 8th leader will not be committed.
             assert_eq!(last_commit.index, 7);
-            let all_stored_commits = core.store.scan_commits(0).unwrap();
+            let all_stored_commits = store.scan_commits(0).unwrap();
             assert_eq!(all_stored_commits.len(), 7);
         }
     }
@@ -1013,7 +994,7 @@ mod test {
         for round in 1..=10 {
             let mut this_round_blocks = Vec::new();
 
-            for (core, _, _) in &mut cores {
+            for (core, _, _, _) in &mut cores {
                 // do not produce any block for authority 3
                 if core.context.own_index == excluded_authority {
                     continue;
@@ -1037,7 +1018,7 @@ mod test {
         // Now send all the produced blocks to core of authority 3. It should produce a new block. If no compression would
         // be applied the we should expect all the previous blocks to be referenced from round 0..=10. However, since compression
         // is applied only the last round's (10) blocks should be referenced + the authority's block of round 0.
-        let (core, _, _) = &mut cores[excluded_authority];
+        let (core, _, _, store) = &mut cores[excluded_authority];
         core.add_blocks(all_blocks).unwrap();
 
         // Assert that a block has been created for round 11 and it references to blocks of round 10 for the other peers, and
@@ -1054,8 +1035,7 @@ mod test {
         }
 
         // Check commits have been persisted to store
-        let last_commit = core
-            .store
+        let last_commit = store
             .read_last_commit()
             .unwrap()
             .expect("last commit should be set");
@@ -1063,7 +1043,7 @@ mod test {
         // round 10. However because there were no blocks produced for authority 3
         // 2 leader rounds will be skipped.
         assert_eq!(last_commit.index, 6);
-        let all_stored_commits = core.store.scan_commits(0).unwrap();
+        let all_stored_commits = store.scan_commits(0).unwrap();
         assert_eq!(all_stored_commits.len(), 6);
     }
 
@@ -1075,6 +1055,7 @@ mod test {
         Core,
         CoreSignalsReceivers,
         UnboundedReceiver<CommittedSubDag>,
+        Arc<impl Store>,
     )> {
         let mut cores = Vec::new();
 
@@ -1113,10 +1094,9 @@ mod test {
                 signals,
                 block_signer,
                 dag_state,
-                store,
             );
 
-            cores.push((core, signal_receivers, receiver));
+            cores.push((core, signal_receivers, receiver, store));
         }
         cores
     }

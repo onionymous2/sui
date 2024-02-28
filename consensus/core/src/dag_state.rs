@@ -11,6 +11,8 @@ use std::{
 
 use consensus_config::AuthorityIndex;
 
+use crate::block::GENESIS_ROUND;
+use crate::stake_aggregator::{QuorumThreshold, StakeAggregator};
 use crate::{
     block::{Block, BlockAPI, BlockDigest, BlockRef, Round, Slot, VerifiedBlock},
     commit::{Commit, CommitIndex},
@@ -155,6 +157,8 @@ impl DagState {
         blocks
     }
 
+    /// Returns all the blocks of the provided `round`. The method will panic if someone attempts
+    /// to request blocks for a round that is before the highest committed round.
     pub(crate) fn get_uncommitted_blocks_at_round(&self, round: Round) -> Vec<VerifiedBlock> {
         if round <= self.last_commit_round() {
             panic!("Round {} have committed blocks!", round);
@@ -257,11 +261,37 @@ impl DagState {
         Ok(blocks)
     }
 
-    /// Returns the last block proposed per authority with round <= `before_round`. The method will look
+    /// Retrieves the last block proposed for the specified `authority`. If no block is found in cache
+    /// then the genesis block is returned as no other block has been received from that authority.
+    pub(crate) fn get_last_block_for_authority(&self, authority: AuthorityIndex) -> VerifiedBlock {
+        if let Some(last) = self.cached_refs[authority].last() {
+            return self
+                .recent_blocks
+                .get(last)
+                .expect("Block should be found in recent blocks")
+                .clone();
+        }
+
+        // if none exists, then fallback to genesis
+        let (_, genesis_block) = self
+            .genesis
+            .iter()
+            .find(|(block_ref, _)| block_ref.author == authority)
+            .expect("Genesis should be found for authority {authority_index}");
+        genesis_block.clone()
+    }
+
+    /// Returns the last block proposed per authority with round <= `before_round`. If `before_round`
+    /// is not provided then block of the highest available round per authority will be returned. The method will look
     /// into cache first, otherwise will fall back in store. The method guarantees to return a result for
     /// each authority, even if that's genesis block. In case of equivocation for an authority's last slot
     /// only one block will be returned (the last in order).
-    pub(crate) fn get_last_block_per_authority(&self, before_round: Round) -> Vec<VerifiedBlock> {
+    pub(crate) fn get_last_block_per_authority(
+        &self,
+        before_round: Option<Round>,
+    ) -> Vec<VerifiedBlock> {
+        let before_round = before_round.unwrap_or(u32::MAX - 1);
+
         let mut blocks = vec![None; self.context.committee.size()];
 
         for (authority_index, block_refs) in self.cached_refs.iter().enumerate() {
@@ -351,7 +381,7 @@ impl DagState {
 
     pub(crate) fn contains_block_at_slot(&self, slot: Slot) -> bool {
         // Always return true for genesis slots.
-        if slot.round == 0 {
+        if slot.round == GENESIS_ROUND {
             return true;
         }
 
@@ -408,6 +438,29 @@ impl DagState {
         }
     }
 
+    /// Detects and returns the blocks of the round that forms the last quorum. The method will return
+    /// the quorum even if that's genesis.
+    pub(crate) fn last_quorum(&self) -> Vec<VerifiedBlock> {
+        // the quorum should exist either on the highest accepted round or the one before. If we fail to detect
+        // a quorum then it means that our DAG has advanced with missing causal history.
+        for round in
+            (self.highest_accepted_round.saturating_sub(1)..=self.highest_accepted_round).rev()
+        {
+            if round == GENESIS_ROUND {
+                return self.genesis_blocks();
+            }
+            let mut quorum = StakeAggregator::<QuorumThreshold>::new();
+            let blocks = self.get_uncommitted_blocks_at_round(round);
+            for block in &blocks {
+                if quorum.add(block.author(), &self.context.committee) {
+                    return blocks;
+                }
+            }
+        }
+
+        panic!("Fatal error, no quorum has been detected in our DAG on the last two rounds.");
+    }
+
     // Write commits to store. Commits should be provided in commit order, meaning
     // the last element in commits is the new last_commit.
     pub(crate) fn write_commits(
@@ -428,6 +481,10 @@ impl DagState {
             assert!(commit.index >= last_commit.index);
         }
         self.last_commit = Some(commit);
+    }
+
+    pub(crate) fn genesis_blocks(&self) -> Vec<VerifiedBlock> {
+        self.genesis.values().cloned().collect()
     }
 
     /// Highest round where a block is committed, which is last commit's leader round.
@@ -458,9 +515,11 @@ impl DagState {
 
 #[cfg(test)]
 mod test {
+    use parking_lot::RwLock;
     use std::vec;
 
     use super::*;
+    use crate::test_dag::build_dag;
     use crate::{
         block::{BlockDigest, BlockRef, BlockTimestampMs, TestBlock, VerifiedBlock},
         storage::mem_store::MemStore,
@@ -517,7 +576,7 @@ mod test {
             .is_none());
 
         // Check slots with uncommitted blocks.
-        for round in 1..=num_rounds {
+        for round in 0..=num_rounds {
             for author in 0..num_authorities {
                 let slot = Slot::new(
                     round,
@@ -528,8 +587,8 @@ mod test {
                 );
                 let blocks = dag_state.get_uncommitted_blocks_at_slot(slot);
 
-                // We only write one block per slot for own index
-                if AuthorityIndex::new_for_test(author) == own_index {
+                // We only write one block per slot for own index or if it's genesis
+                if AuthorityIndex::new_for_test(author) == own_index || round == GENESIS_ROUND {
                     assert_eq!(blocks.len(), 1);
                 } else {
                     assert_eq!(blocks.len(), num_blocks_per_slot);
@@ -873,7 +932,7 @@ mod test {
 
         // WHEN search for the latest blocks
         let before_round = 2;
-        let last_blocks = dag_state.get_last_block_per_authority(before_round);
+        let last_blocks = dag_state.get_last_block_per_authority(Some(before_round));
 
         // THEN
         assert_eq!(last_blocks[0].round(), 0);
@@ -885,12 +944,103 @@ mod test {
         dag_state.flush_cache_for_testing(3);
 
         // AND
-        let last_blocks = dag_state.get_last_block_per_authority(before_round);
+        let last_blocks = dag_state.get_last_block_per_authority(Some(before_round));
 
         // THEN blocks should be fetched now from store
         assert_eq!(last_blocks[0].round(), 0);
         assert_eq!(last_blocks[1].round(), 1);
         assert_eq!(last_blocks[2].round(), 2);
         assert_eq!(last_blocks[3].round(), 2);
+    }
+
+    #[test]
+    fn test_last_quorum() {
+        // GIVEN
+        let (context, _) = Context::new_for_test(4);
+        let context = Arc::new(context);
+        let store = Arc::new(MemStore::new());
+        let dag_state = Arc::new(RwLock::new(DagState::new(context.clone(), store.clone())));
+
+        // WHEN no blocks exist then genesis should be returned
+        {
+            let (_, genesis) = Block::genesis(context.clone());
+
+            assert_eq!(dag_state.read().last_quorum(), genesis);
+        }
+
+        // WHEN a fully connected DAG up to round 4 is created, then round 4 blocks should be returned as quorum
+        {
+            let round_4_blocks = build_dag(context, dag_state.clone(), None, 4);
+
+            let last_quorum = dag_state.read().last_quorum();
+
+            assert_eq!(
+                last_quorum
+                    .into_iter()
+                    .map(|block| block.reference())
+                    .collect::<Vec<_>>(),
+                round_4_blocks
+            );
+        }
+
+        // WHEN adding one more block at round 5, still round 4 should be returned as quorum
+        {
+            let block = VerifiedBlock::new_for_test(TestBlock::new(5, 0).build());
+            dag_state.write().accept_block(block);
+
+            let round_4_blocks = dag_state.read().get_uncommitted_blocks_at_round(4);
+
+            let last_quorum = dag_state.read().last_quorum();
+
+            assert_eq!(last_quorum, round_4_blocks);
+        }
+    }
+
+    #[test]
+    fn test_last_block_for_authority() {
+        // GIVEN
+        let (context, _) = Context::new_for_test(4);
+        let context = Arc::new(context);
+        let store = Arc::new(MemStore::new());
+        let dag_state = Arc::new(RwLock::new(DagState::new(context.clone(), store.clone())));
+
+        // WHEN no blocks exist then genesis should be returned
+        {
+            let (my_genesis, _) = Block::genesis(context.clone());
+
+            assert_eq!(
+                dag_state
+                    .read()
+                    .get_last_block_for_authority(context.own_index),
+                my_genesis
+            );
+        }
+
+        // WHEN adding some blocks for authorities, only the last ones should be returned
+        {
+            // add blocks up to round 4
+            build_dag(context.clone(), dag_state.clone(), None, 4);
+
+            // add block 5 for authority 0
+            let block = VerifiedBlock::new_for_test(TestBlock::new(5, 0).build());
+            dag_state.write().accept_block(block);
+
+            let block = dag_state
+                .read()
+                .get_last_block_for_authority(AuthorityIndex::new_for_test(0));
+            assert_eq!(block.round(), 5);
+
+            for (authority_index, _) in context.committee.authorities() {
+                let block = dag_state
+                    .read()
+                    .get_last_block_for_authority(authority_index);
+
+                if authority_index.value() == 0 {
+                    assert_eq!(block.round(), 5);
+                } else {
+                    assert_eq!(block.round(), 4);
+                }
+            }
+        }
     }
 }

@@ -208,7 +208,7 @@ mod test {
             sender.clone(),
             0, // last_processed_index
             dag_state.clone(),
-            store.clone(),
+            store,
         );
         let core = Core::new(
             context.clone(),
@@ -218,7 +218,6 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state,
-            store,
         );
 
         let (core_dispatcher, handle) = ChannelCoreThreadDispatcher::start(core, context);

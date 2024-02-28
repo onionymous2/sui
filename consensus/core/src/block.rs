@@ -27,7 +27,7 @@ use crate::context::Context;
 use crate::error::ConsensusResult;
 use crate::{ensure, error::ConsensusError};
 
-const GENESIS_ROUND: Round = 0;
+pub(crate) const GENESIS_ROUND: Round = 0;
 
 /// Round number of a block.
 pub type Round = u32;
