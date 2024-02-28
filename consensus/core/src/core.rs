@@ -365,12 +365,12 @@ impl Core {
             // Search for all the leaders. If at least one is not found, then return false.
             // A linear search should be fine here as the set of elements is not expected to be small enough and more sophisticated
             // data structures might not give us much here.
-            if dag_state.contains_block_at_slot(leader) {
-                return true;
+            if !dag_state.contains_block_at_slot(leader) {
+                return false;
             }
         }
 
-        false
+        true
     }
 
     /// Returns the leaders of the provided round.
