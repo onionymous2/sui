@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::num::NonZeroUsize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
@@ -37,7 +38,7 @@ use crate::{
 };
 
 // TODO: Move to protocol config once initial value is finalized.
-pub(crate) const NUM_LEADERS_PER_ROUND: usize = 1;
+pub(crate) const DEFAULT_NUM_LEADERS_PER_ROUND: usize = 1;
 
 #[allow(dead_code)]
 pub(crate) struct Core {
@@ -71,6 +72,8 @@ pub(crate) struct Core {
     block_signer: ProtocolKeyPair,
     /// The DagState is the gateway to interact with storage and buffered block data.
     dag_state: Arc<RwLock<DagState>>,
+    /// The number of leaders per round for the commit rule
+    num_of_leaders: NonZeroUsize,
 }
 
 #[allow(dead_code)]
@@ -83,11 +86,12 @@ impl Core {
         signals: CoreSignals,
         block_signer: ProtocolKeyPair,
         dag_state: Arc<RwLock<DagState>>,
+        num_of_leaders: NonZeroUsize,
     ) -> Self {
         let last_decided_leader = dag_state.read().last_commit_leader();
 
         let committer = UniversalCommitterBuilder::new(context.clone(), dag_state.clone())
-            .with_number_of_leaders(NUM_LEADERS_PER_ROUND)
+            .with_number_of_leaders(num_of_leaders.get())
             .with_pipeline(true)
             .build();
 
@@ -116,6 +120,7 @@ impl Core {
             signals,
             block_signer,
             dag_state,
+            num_of_leaders,
         }
         .recover()
     }
@@ -206,7 +211,7 @@ impl Core {
         // emit a signal that a leader has been received. Send the whole sequence of leaders that have
         // been found so far.
         if new_leader_received {
-            let mut accepted_leaders = vec![None; NUM_LEADERS_PER_ROUND];
+            let mut accepted_leaders = vec![None; self.num_of_leaders.get()];
             for (i, leader) in leaders.into_iter().enumerate() {
                 let dag_state = self.dag_state.read();
                 if dag_state.contains_block_at_slot(leader) {
@@ -457,13 +462,13 @@ impl CoreSignals {
     const BROADCAST_BACKLOG_CAPACITY: usize = 1000;
 
     #[allow(dead_code)]
-    pub fn new() -> (Self, CoreSignalsReceivers) {
+    pub fn new(num_leaders_per_round: NonZeroUsize) -> (Self, CoreSignalsReceivers) {
         let (tx_block_broadcast, _rx_block_broadcast) =
             broadcast::channel::<VerifiedBlock>(Self::BROADCAST_BACKLOG_CAPACITY);
         let (block_ready_sender, block_ready_receiver) = watch::channel(None);
         let (new_round_sender, new_round_receiver) = watch::channel(0);
         let (leader_accepted_sender, leader_accepted_receiver) =
-            watch::channel((0, vec![None; NUM_LEADERS_PER_ROUND]));
+            watch::channel((0, vec![None; num_leaders_per_round.get()]));
 
         let me = Self {
             tx_block_broadcast: tx_block_broadcast.clone(),
@@ -591,6 +596,7 @@ mod test {
         let store = Arc::new(MemStore::new());
         let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
         let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
+        let num_of_leaders = NonZeroUsize::new(DEFAULT_NUM_LEADERS_PER_ROUND).unwrap();
 
         // Create test blocks for all the authorities for 4 rounds and populate them in store
         let (_, mut last_round_blocks) = Block::genesis(context.clone());
@@ -631,7 +637,7 @@ mod test {
         assert_eq!(dag_state.read().last_commit_index(), 0);
 
         // Now spin up core
-        let (signals, signal_receivers) = CoreSignals::new();
+        let (signals, signal_receivers) = CoreSignals::new(num_of_leaders);
         let mut core = Core::new(
             context.clone(),
             transaction_consumer,
@@ -640,6 +646,7 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
+            num_of_leaders,
         );
 
         // New round should be 5
@@ -687,6 +694,7 @@ mod test {
         let store = Arc::new(MemStore::new());
         let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
         let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
+        let num_of_leaders = NonZeroUsize::new(DEFAULT_NUM_LEADERS_PER_ROUND).unwrap();
 
         // Create test blocks for all authorities except our's (index = 0).
         let (_, mut last_round_blocks) = Block::genesis(context.clone());
@@ -734,7 +742,7 @@ mod test {
         assert_eq!(dag_state.read().last_commit_index(), 0);
 
         // Now spin up core
-        let (signals, signal_receivers) = CoreSignals::new();
+        let (signals, signal_receivers) = CoreSignals::new(num_of_leaders);
         let mut core = Core::new(
             context.clone(),
             transaction_consumer,
@@ -743,6 +751,7 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
+            num_of_leaders,
         );
 
         // New round should be 4
@@ -791,6 +800,7 @@ mod test {
             config
         });
 
+        let num_of_leaders = NonZeroUsize::new(DEFAULT_NUM_LEADERS_PER_ROUND).unwrap();
         let (context, mut key_pairs) = Context::new_for_test(4);
         let context = Arc::new(context);
         let store = Arc::new(MemStore::new());
@@ -799,7 +809,7 @@ mod test {
         let block_manager = BlockManager::new(context.clone(), dag_state.clone());
         let (transaction_client, tx_receiver) = TransactionClient::new(context.clone());
         let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
-        let (signals, _signal_receivers) = CoreSignals::new();
+        let (signals, _signal_receivers) = CoreSignals::new(num_of_leaders);
 
         let (sender, _receiver) = unbounded_channel();
         let commit_observer = CommitObserver::new(
@@ -818,6 +828,7 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
+            num_of_leaders,
         );
 
         // Send some transactions
@@ -885,6 +896,7 @@ mod test {
         telemetry_subscribers::init_for_testing();
         let (context, mut key_pairs) = Context::new_for_test(4);
         let context = Arc::new(context);
+        let num_of_leaders = NonZeroUsize::new(DEFAULT_NUM_LEADERS_PER_ROUND).unwrap();
 
         let store = Arc::new(MemStore::new());
         let dag_state = Arc::new(RwLock::new(DagState::new(context.clone(), store.clone())));
@@ -892,7 +904,7 @@ mod test {
         let block_manager = BlockManager::new(context.clone(), dag_state.clone());
         let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
         let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
-        let (signals, _signal_receivers) = CoreSignals::new();
+        let (signals, _signal_receivers) = CoreSignals::new(num_of_leaders);
 
         let (sender, _receiver) = unbounded_channel();
         let commit_observer = CommitObserver::new(
@@ -911,6 +923,7 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
+            num_of_leaders,
         );
 
         let mut expected_ancestors = BTreeSet::new();
@@ -1023,6 +1036,15 @@ mod test {
                 .await;
                 assert_eq!(new_round, round);
 
+                // We do not expect to receive a signal for updated leaders as we already proposed
+                // A "new round" signal should be received given that all the blocks of previous round have been processed
+                let (leader_round, leaders) = signal_receivers
+                    .leader_accepted_receiver()
+                    .borrow_and_update()
+                    .clone();
+                assert_eq!(leader_round, 0);
+                assert!(leaders.iter().all(Option::is_none));
+
                 // Check that a new block has been proposed
                 let block_ref = receive(
                     Duration::from_secs(1),
@@ -1070,6 +1092,9 @@ mod test {
             assert_eq!(all_stored_commits.len(), 7);
         }
     }
+
+    #[tokio::test]
+    async fn test_notify_leader_update() {}
 
     #[tokio::test]
     async fn test_core_compress_proposal_references() {
@@ -1149,6 +1174,7 @@ mod test {
         Arc<impl Store>,
     )> {
         let mut cores = Vec::new();
+        let num_of_leaders = NonZeroUsize::new(DEFAULT_NUM_LEADERS_PER_ROUND).unwrap();
 
         for index in 0..authorities.len() {
             let (committee, mut signers) = local_committee_and_keys(0, authorities.clone());
@@ -1164,7 +1190,7 @@ mod test {
             let block_manager = BlockManager::new(context.clone(), dag_state.clone());
             let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
             let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
-            let (signals, signal_receivers) = CoreSignals::new();
+            let (signals, signal_receivers) = CoreSignals::new(num_of_leaders);
 
             let (sender, receiver) = unbounded_channel();
             let commit_observer = CommitObserver::new(
@@ -1188,6 +1214,7 @@ mod test {
                 signals,
                 block_signer,
                 dag_state,
+                num_of_leaders,
             );
 
             cores.push((core, signal_receivers, receiver, store));
