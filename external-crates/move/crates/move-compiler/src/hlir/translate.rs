@@ -27,6 +27,7 @@ use once_cell::sync::Lazy;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     convert::TryInto,
+    sync::Arc,
 };
 
 //**************************************************************************************************
@@ -121,7 +122,7 @@ struct Context<'env> {
 impl<'env> Context<'env> {
     pub fn new(
         env: &'env mut CompilationEnv,
-        pre_compiled_lib_opt: Option<&FullyCompiledProgram>,
+        pre_compiled_lib_opt: Option<Arc<FullyCompiledProgram>>,
         prog: &T::Program_,
     ) -> Self {
         fn add_struct_fields(
@@ -248,7 +249,7 @@ impl<'env> Context<'env> {
 
 pub fn program(
     compilation_env: &mut CompilationEnv,
-    pre_compiled_lib: Option<&FullyCompiledProgram>,
+    pre_compiled_lib: Option<Arc<FullyCompiledProgram>>,
     prog: T::Program,
 ) -> H::Program {
     detect_dead_code_analysis(compilation_env, &prog);

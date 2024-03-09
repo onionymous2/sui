@@ -37,7 +37,10 @@ use crate::{
     FullyCompiledProgram,
 };
 use move_ir_types::location::*;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+};
 
 //**************************************************************************************************
 // Entry
@@ -45,14 +48,18 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub fn program(
     compilation_env: &mut CompilationEnv,
-    pre_compiled_lib: Option<&FullyCompiledProgram>,
+    pre_compiled_lib: Option<Arc<FullyCompiledProgram>>,
     prog: N::Program,
 ) -> T::Program {
     let N::Program {
         info,
         inner: N::Program_ { modules: nmodules },
     } = prog;
-    let mut context = Box::new(Context::new(compilation_env, pre_compiled_lib, info));
+    let mut context = Box::new(Context::new(
+        compilation_env,
+        pre_compiled_lib.clone(),
+        info,
+    ));
 
     extract_macros(&mut context, &nmodules);
     let mut modules = modules(&mut context, nmodules);
